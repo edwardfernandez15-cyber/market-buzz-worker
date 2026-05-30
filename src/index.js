@@ -59,11 +59,8 @@ export default {
         service: "finance-ninja-api",
         ts: Date.now(),
         secrets: {
-          FINNHUB_API_KEY:   env.FINNHUB_API_KEY   ? "✓" : "✗ missing",
-          NEWSAPI_KEY:       env.NEWSAPI_KEY        ? "✓" : "✗ missing",
-          TIPRANKS_API_KEY:  env.TIPRANKS_API_KEY   ? "✓" : "— optional",
-          TIPRANKS_BASE_URL: env.TIPRANKS_BASE_URL  ? "✓" : "— optional",
-          TIPRANKS_PT_PATH:  env.TIPRANKS_PT_PATH   ? "✓" : "— optional",
+          FINNHUB_API_KEY:  env.FINNHUB_API_KEY  ? "✓" : "✗ missing — required for quotes",
+          TIPRANKS_API_KEY: env.TIPRANKS_API_KEY ? "✓" : "— optional (get free key at mcp.tipranks.com)",
         },
         endpoints: ["/stock", "/api/quote", "/api/consensus", "/api/bullsbears",
                     "/api/insiders", "/api/pt", "/api/news", "/api/feed",
@@ -131,20 +128,59 @@ export default {
           calendarEarningsData: tr?.calendarEarningsData ?? { nextEarningsDate: null },
         };
 
-        // Bulls/bears (non-fatal)
+        // Bulls/bears via TipRanks MCP (non-fatal)
         let bullsBears = null;
-        if (env.TIPRANKS_API_KEY && env.TIPRANKS_BASE_URL) {
-          const bb = await tipranksGet(ticker, "/v1/stocks/bulls-bears", env).catch(() => null);
-          if (bb) {
-            bullsBears = {
-              bullish:   bb.bullishSummary ?? bb.bullish   ?? null,
-              bearish:   bb.bearishSummary ?? bb.bearish   ?? null,
-              updatedOn: bb.updatedOn      ?? bb.updatedAt ?? null,
-            };
-          }
+        if (env.TIPRANKS_API_KEY) {
+          try {
+            const bb = await tipranksCall("get_bulls_bears_summary", { tickers: ticker }, env);
+            const d = Array.isArray(bb?.data) ? bb.data[0] : (bb ?? {});
+            if (d.bullishSummary || d.bearishSummary || d.bullish || d.bearish) {
+              bullsBears = {
+                bullishSummary: d.bullishSummary ?? d.bullish   ?? null,
+                bearishSummary: d.bearishSummary ?? d.bearish   ?? null,
+                updatedOn:      d.updatedOn      ?? d.updatedAt ?? null,
+              };
+            }
+          } catch (_) {}
         }
 
-        const response = json({ quote: q, asset, news: [], bullsBears }, 200, cors);
+        // News: TipRanks get_assets_news (has sentiment) → Yahoo Finance fallback
+        let stockNews = [];
+        if (env.TIPRANKS_API_KEY) {
+          try {
+            const nd = await tipranksCall("get_assets_news", { tickers: ticker, count: 8 }, env);
+            const articles = nd?.assetNewsArticles ?? nd?.news ?? (Array.isArray(nd) ? nd : []);
+            if (articles.length) {
+              stockNews = articles.map(a => ({
+                ticker,
+                title:       a.title,
+                url:         a.url || a.link || "#",
+                siteName:    a.siteName || a.publisher || a.source || "TipRanks",
+                sentiment:   a.sentiment || "Neutral",
+                publishTime: a.publishTime || a.publishedAt || new Date().toISOString(),
+              }));
+            }
+          } catch (_) {}
+        }
+        if (stockNews.length === 0) {
+          try {
+            const yhUrl = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(ticker)}&newsCount=8&quotesCount=0`;
+            const yh = await fetch(yhUrl, { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } });
+            if (yh.ok) {
+              const yd = await yh.json();
+              stockNews = (yd?.news ?? []).map(a => ({
+                ticker,
+                title:       a.title,
+                url:         a.link || "#",
+                siteName:    a.publisher || "Yahoo Finance",
+                sentiment:   "Neutral",
+                publishTime: new Date((a.providerPublishTime ?? 0) * 1000).toISOString(),
+              }));
+            }
+          } catch (_) {}
+        }
+
+        const response = json({ quote: q, asset, news: stockNews, bullsBears }, 200, cors);
         await putCache(cache, cacheKey, response, ctx, TTL.stock);
         return response;
       }
@@ -173,19 +209,18 @@ export default {
         if (!symbol) return json({ error: "Missing symbol" }, 400, cors);
         requireTipRanks(env);
 
-        const data = await tipranksGet(symbol, "/v1/stocks/consensus", env);
+        const data = await tipranksCall("get_assets_data", { tickers: symbol }, env);
+        const a = Array.isArray(data?.assetsData) ? data.assetsData[0] : (data ?? {});
         const response = json({
-          symbol,
-          source:               "TipRanks",
-          smartScore:           data.smartScore           ?? null,
-          analystConsensus:     data.analystConsensus     ?? null,
-          bestAnalystConsensus: data.bestAnalystConsensus ?? null,
-          priceTarget:          data.priceTarget          ?? null,
-          priceTargetUpside:    data.priceTargetUpside    ?? null,
-          hedgeFundSentiment:   data.hedgeFundSentimentData ?? null,
-          insiderSentiment:     data.insiderSentimentData   ?? null,
-          bloggerSentiment:     data.bloggerSentimentData   ?? null,
-          raw: data,
+          symbol, source: "TipRanks",
+          smartScore:           a.smartScore           ?? null,
+          analystConsensus:     a.analystConsensus     ?? null,
+          bestAnalystConsensus: a.bestAnalystConsensus ?? null,
+          priceTarget:          a.priceTarget          ?? null,
+          priceTargetUpside:    a.priceTargetUpside    ?? null,
+          hedgeFundSentiment:   a.hedgeFundSentimentData ?? null,
+          insiderSentiment:     a.insiderSentimentData   ?? null,
+          bloggerSentiment:     a.bloggerSentimentData   ?? null,
         }, 200, cors);
         await putCache(cache, cacheKey, response, ctx, TTL.consensus);
         return response;
@@ -199,14 +234,13 @@ export default {
         if (!symbol) return json({ error: "Missing symbol" }, 400, cors);
         requireTipRanks(env);
 
-        const data = await tipranksGet(symbol, "/v1/stocks/bulls-bears", env);
+        const data = await tipranksCall("get_bulls_bears_summary", { tickers: symbol }, env);
+        const d = Array.isArray(data?.data) ? data.data[0] : (data ?? {});
         const response = json({
-          symbol,
-          source:    "TipRanks",
-          bullish:   data.bullishSummary ?? data.bullish   ?? null,
-          bearish:   data.bearishSummary ?? data.bearish   ?? null,
-          updatedOn: data.updatedOn      ?? data.updatedAt ?? null,
-          raw: data,
+          symbol, source: "TipRanks",
+          bullish:   d.bullishSummary ?? d.bullish   ?? null,
+          bearish:   d.bearishSummary ?? d.bearish   ?? null,
+          updatedOn: d.updatedOn      ?? d.updatedAt ?? null,
         }, 200, cors);
         await putCache(cache, cacheKey, response, ctx, TTL.bullsbears);
         return response;
@@ -220,41 +254,31 @@ export default {
         if (!symbol) return json({ error: "Missing symbol" }, 400, cors);
         requireTipRanks(env);
 
-        const data = await tipranksGet(symbol, "/v1/stocks/insider-transactions", env);
+        const data = await tipranksCall("get_insider_transactions", { tickers: symbol }, env);
         const response = json({
-          symbol,
-          source:       "TipRanks",
-          transactions: data.insiderTransactions ?? data.transactions ?? [],
+          symbol, source: "TipRanks",
+          transactions: data.insiderTransactions ?? data.transactions ?? data ?? [],
           sentiment:    data.insiderSentimentData ?? null,
-          raw: data,
         }, 200, cors);
         await putCache(cache, cacheKey, response, ctx, TTL.insiders);
         return response;
       }
 
       // ══════════════════════════════════════════════════════════════════════
-      // /api/pt?symbol=AAPL
+      // /api/pt?symbol=AAPL  — price targets via get_assets_data
       // ══════════════════════════════════════════════════════════════════════
       if (path === "/api/pt") {
         const symbol = sym(url, "symbol");
         if (!symbol) return json({ error: "Missing symbol" }, 400, cors);
         requireTipRanks(env);
 
-        const endpoint = env.TIPRANKS_PT_PATH || "/v1/stocks/price-targets";
-        const data = await tipranksGet(symbol, endpoint, env, env.TIPRANKS_PT_URL);
-
+        const data = await tipranksCall("get_assets_data", { tickers: symbol }, env);
+        const a = Array.isArray(data?.assetsData) ? data.assetsData[0] : (data ?? {});
         const response = json({
-          symbol,
-          source: "TipRanks",
-          target: {
-            mean:      data.mean      ?? data.targetMean   ?? null,
-            median:    data.median    ?? data.targetMedian ?? null,
-            high:      data.high      ?? data.targetHigh   ?? null,
-            low:       data.low       ?? data.targetLow    ?? null,
-            updatedAt: data.updatedAt ?? data.lastUpdated  ?? null,
-          },
-          analysts:        data.analysts        ?? data.analystTargets ?? [],
-          recommendations: data.recommendations ?? data.ratingMix      ?? [],
+          symbol, source: "TipRanks",
+          priceTarget:       a.priceTarget       ?? null,
+          priceTargetUpside: a.priceTargetUpside ?? null,
+          analystConsensus:  a.analystConsensus  ?? null,
         }, 200, cors);
         await putCache(cache, cacheKey, response, ctx, TTL.pt);
         return response;
@@ -266,19 +290,21 @@ export default {
       if (path === "/api/trending") {
         let items = [];
 
-        if (env.TIPRANKS_API_KEY && env.TIPRANKS_BASE_URL) {
+        if (env.TIPRANKS_API_KEY) {
           try {
-            const data = await tipranksGet("", "/v1/stocks/trending", env);
+            const data = await tipranksCall("get_trending_stocks", {}, env);
             items = (Array.isArray(data) ? data : data.stocks ?? []).slice(0, 20);
           } catch (_) {}
         }
 
         if (items.length === 0 && env.FINNHUB_API_KEY) {
           try {
-            const r = await fhFetch(`https://finnhub.io/api/v1/stock/symbol?exchange=US&token=${env.FINNHUB_API_KEY}`);
+            const r = await fhFetch(`https://finnhub.io/api/v1/news?category=general&token=${env.FINNHUB_API_KEY}`);
             if (Array.isArray(r)) {
-              items = r.filter(s => s.type === "Common Stock").slice(0, 20)
-                .map(s => ({ ticker: s.symbol, name: s.description }));
+              const seen = new Set();
+              items = r.flatMap(a => extractTickers((a.related||"")+" "+a.headline))
+                .filter(t => t && !seen.has(t) && seen.add(t))
+                .slice(0, 20).map(t => ({ ticker: t }));
             }
           } catch (_) {}
         }
@@ -290,34 +316,37 @@ export default {
 
       // ══════════════════════════════════════════════════════════════════════
       // /api/news?q=Apple
+      // Primary: Yahoo Finance (free, no key). Fallback: Finnhub.
       // ══════════════════════════════════════════════════════════════════════
       if (path === "/api/news") {
-        const q = (url.searchParams.get("q") || "").trim();
-        if (!q) return json({ error: "Missing q parameter" }, 400, cors);
+        const q = (url.searchParams.get("q") || "AI infrastructure data center").trim();
 
         let items = [];
 
-        if (env.NEWSAPI_KEY) {
-          try {
-            const r = await fhFetch(
-              `https://newsapi.org/v2/everything?q=${encodeURIComponent(q)}&sortBy=publishedAt&pageSize=20&language=en&apiKey=${env.NEWSAPI_KEY}`
-            );
-            if (r?.articles?.length) {
-              items = r.articles.map((a, i) => ({
-                id:      `na-${Date.now()}-${i}`,
-                ts:      new Date(a.publishedAt).getTime(),
-                source:  a.source?.name || "News",
+        // 1. Yahoo Finance news search (no API key needed)
+        try {
+          const yhUrl = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&newsCount=20&quotesCount=0&enableFuzzyQuery=false`;
+          const yh = await fetch(yhUrl, { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } });
+          if (yh.ok) {
+            const data = await yh.json();
+            const news = data?.news ?? [];
+            if (news.length) {
+              items = news.map((a, i) => ({
+                id:      `yh-${Date.now()}-${i}`,
+                ts:      (a.providerPublishTime ?? 0) * 1000,
+                source:  a.publisher || "Yahoo Finance",
                 tag:     "news",
                 title:   a.title,
-                url:     a.url,
-                tickers: extractTickers(a.title + " " + (a.description || "")),
-                summary: a.description || "",
-                image:   a.urlToImage || null,
+                url:     a.link || "#",
+                tickers: (a.relatedTickers ?? []).map(t => t.replace("^","").toUpperCase()),
+                summary: a.summary || "",
+                image:   a.thumbnail?.resolutions?.[0]?.url || null,
               }));
             }
-          } catch (_) {}
-        }
+          }
+        } catch (_) {}
 
+        // 2. Finnhub fallback
         if (items.length === 0 && env.FINNHUB_API_KEY) {
           try {
             const r = await fhFetch(`https://finnhub.io/api/v1/news?category=technology&token=${env.FINNHUB_API_KEY}`);
@@ -343,15 +372,42 @@ export default {
       }
 
       // ══════════════════════════════════════════════════════════════════════
-      // /api/feed
+      // /api/feed  — Live market headlines
+      // Primary: Yahoo Finance general news (no key). Fallback: Finnhub.
       // ══════════════════════════════════════════════════════════════════════
       if (path === "/api/feed") {
-        if (env.FINNHUB_API_KEY) {
+        let items = [];
+
+        // 1. Yahoo Finance general market news (no API key needed)
+        try {
+          const yhUrl = `https://query1.finance.yahoo.com/v1/finance/search?q=stock+market+earnings&newsCount=30&quotesCount=0`;
+          const yh = await fetch(yhUrl, { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } });
+          if (yh.ok) {
+            const data = await yh.json();
+            const news = data?.news ?? [];
+            if (news.length) {
+              items = news.map((a, i) => ({
+                id:      `feed-yh-${i}-${a.providerPublishTime ?? i}`,
+                ts:      (a.providerPublishTime ?? 0) * 1000,
+                source:  a.publisher || "Yahoo Finance",
+                tag:     "market",
+                title:   a.title,
+                url:     a.link || "#",
+                tickers: (a.relatedTickers ?? []).map(t => t.replace("^","").toUpperCase()),
+                summary: a.summary || "",
+                image:   a.thumbnail?.resolutions?.[0]?.url || null,
+              }));
+            }
+          }
+        } catch (_) {}
+
+        // 2. Finnhub fallback (requires key)
+        if (items.length === 0 && env.FINNHUB_API_KEY) {
           try {
             const r = await fhFetch(`https://finnhub.io/api/v1/news?category=general&token=${env.FINNHUB_API_KEY}`);
             if (Array.isArray(r) && r.length) {
-              const items = r.slice(0, 30).map((a, i) => ({
-                id:      `feed-${i}-${a.datetime}`,
+              items = r.slice(0, 30).map((a, i) => ({
+                id:      `feed-fh-${i}-${a.datetime}`,
                 ts:      a.datetime * 1000,
                 source:  a.source || "Market Feed",
                 tag:     a.category || "market",
@@ -361,17 +417,21 @@ export default {
                 summary: a.summary || "",
                 image:   a.image || null,
               }));
-              const response = json(items, 200, cors);
-              await putCache(cache, cacheKey, response, ctx, TTL.feed);
-              return response;
             }
           } catch (_) {}
         }
-        return json([{
-          id: "fn-fallback", ts: Date.now(), source: "Finance Ninja",
-          tag: "system", title: "Configure FINNHUB_API_KEY to enable live headlines",
-          url: "#", tickers: [], summary: "", image: null,
-        }], 200, cors);
+
+        if (items.length === 0) {
+          return json([{
+            id: "fn-fallback", ts: Date.now(), source: "Finance Ninja",
+            tag: "system", title: "Live feed loading — check back shortly",
+            url: "#", tickers: [], summary: "", image: null,
+          }], 200, cors);
+        }
+
+        const response = json(items, 200, cors);
+        await putCache(cache, cacheKey, response, ctx, TTL.feed);
+        return response;
       }
 
       // ── Root ──────────────────────────────────────────────────────────────
@@ -448,44 +508,52 @@ async function finnhubQuote(ticker, env) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TIPRANKS HELPERS
+// TIPRANKS MCP HELPERS
+// Calls the TipRanks MCP server via JSON-RPC 2.0.
+// Only TIPRANKS_API_KEY needed — get a free key at mcp.tipranks.com/dev/signup
+// Free tier: 5 rpm / 25 req/day. Upgrade at mcp.tipranks.com/dev/billing.
 // ─────────────────────────────────────────────────────────────────────────────
 
+const TIPRANKS_MCP_URL = "https://mcp.tipranks.com/mcp";
+
 function requireTipRanks(env) {
-  if (!env.TIPRANKS_API_KEY)  throw Object.assign(new Error("TIPRANKS_API_KEY not configured"),  { status: 500 });
-  if (!env.TIPRANKS_BASE_URL) throw Object.assign(new Error("TIPRANKS_BASE_URL not configured"), { status: 500 });
+  if (!env.TIPRANKS_API_KEY) throw Object.assign(
+    new Error("TIPRANKS_API_KEY not configured — get a free key at mcp.tipranks.com/dev/signup"),
+    { status: 500 }
+  );
 }
 
-async function tipranksGet(symbol, path, env, urlOverride = null) {
-  const base = (env.TIPRANKS_BASE_URL || "").replace(/\/$/, "");
-  let url;
-  if (urlOverride) {
-    url = urlOverride.replace("{symbol}", encodeURIComponent(symbol));
-  } else {
-    const p    = path.startsWith("/") ? path : `/${path}`;
-    const join = p.includes("?") ? "&" : "?";
-    url = `${base}${p}${symbol ? `${join}symbol=${encodeURIComponent(symbol)}` : ""}`;
-  }
-
+// Call any TipRanks MCP tool by name.
+// Returns the parsed JSON payload from result.content[0].text.
+async function tipranksCall(toolName, args, env) {
+  const url = `${TIPRANKS_MCP_URL}/?apikey=${encodeURIComponent(env.TIPRANKS_API_KEY)}`;
   const r = await fetch(url, {
-    headers: {
-      "Authorization": `Bearer ${env.TIPRANKS_API_KEY}`,
-      "x-api-key":     env.TIPRANKS_API_KEY,
-      "Accept":        "application/json",
-      "User-Agent":    "FinanceNinja/1.0",
-    },
+    method:  "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id:      Date.now(),
+      method:  "tools/call",
+      params:  { name: toolName, arguments: args },
+    }),
   });
-
-  const text = await r.text().catch(() => "");
-  if (!r.ok) throw new Error(`TipRanks ${r.status}: ${text.slice(0, 200)}`);
-  try { return JSON.parse(text); }
-  catch (_) { throw new Error(`TipRanks non-JSON: ${text.slice(0, 100)}`); }
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    throw new Error(`TipRanks MCP HTTP ${r.status}: ${t.slice(0, 200)}`);
+  }
+  const json = await r.json();
+  if (json?.error) throw new Error(`TipRanks MCP error: ${JSON.stringify(json.error)}`);
+  // MCP wraps the payload as a JSON string in result.content[0].text
+  const raw = json?.result?.content?.[0]?.text;
+  if (!raw) throw new Error(`Empty MCP result from ${toolName}`);
+  return JSON.parse(raw);
 }
 
+// Get the 40-field asset snapshot for a ticker using get_assets_data.
 async function tipranksAsset(ticker, env) {
-  if (!env.TIPRANKS_API_KEY || !env.TIPRANKS_BASE_URL) return null;
+  if (!env.TIPRANKS_API_KEY) return null;
   try {
-    const data = await tipranksGet(ticker, "/v1/stocks/asset-data", env);
+    const data = await tipranksCall("get_assets_data", { tickers: ticker }, env);
     const a = Array.isArray(data?.assetsData) ? data.assetsData[0] : (data?.asset ?? data ?? {});
     return {
       companyName:             a.companyName          ?? a.name        ?? ticker,
@@ -513,70 +581,3 @@ async function tipranksAsset(ticker, env) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CACHE HELPER
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function putCache(cache, cacheKey, response, ctx, ttlSeconds) {
-  try {
-    const clone = response.clone();
-    const h     = new Headers(clone.headers);
-    h.set("Cache-Control", `public, max-age=${ttlSeconds}`);
-    const cacheable = new Response(clone.body, { status: clone.status, headers: h });
-    const put = () => cache.put(cacheKey, cacheable);
-    ctx?.waitUntil ? ctx.waitUntil(put()) : await put();
-  } catch (_) {}
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// UTILITY
-// ─────────────────────────────────────────────────────────────────────────────
-
-function json(data, status = 200, extraHeaders = {}) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type":  "application/json",
-      "Cache-Control": "no-store",
-      "X-Cache":       "MISS",
-      ...extraHeaders,
-    },
-  });
-}
-
-function sym(url, param) {
-  return (url.searchParams.get(param) || "").toUpperCase().trim() || null;
-}
-
-// FIX: expanded ticker list — BA and many others were missing
-const KNOWN_TICKERS = new Set([
-  // AI Infrastructure universe
-  "GEV","PWR","MTZ","MYRG","CEG","VST","VRT","SBGSY","ABB","TT","MOD","NVT",
-  "CC","ETN","MRVL","COHR","LITE","AVGO","CSCO","ALAB","CRDO","ANET",
-  // Mega-cap tech
-  "NVDA","AAPL","MSFT","META","GOOGL","GOOG","AMZN","TSLA","AMD","INTC",
-  "SMCI","ARM","TSM","ORCL","IBM","CRM","ADBE","NOW","SNPS","CDNS",
-  // Aerospace & Defense
-  "BA","LMT","RTX","NOC","GD","HII","TDG","HEI","AXON","LDOS",
-  // Financials
-  "JPM","BAC","GS","MS","WFC","C","BLK","SCHW","AXP","V","MA","PYPL","SQ",
-  // Healthcare
-  "UNH","JNJ","LLY","PFE","MRK","ABBV","TMO","DHR","ABT","ISRG",
-  // Consumer & Retail
-  "WMT","COST","AMZN","TGT","HD","LOW","NKE","SBUX","MCD","DIS",
-  // Energy
-  "XOM","CVX","COP","SLB","EOG","PXD","OXY","HAL","VLO","PSX",
-  // Industrials
-  "CAT","DE","UNP","UPS","FDX","HON","MMM","EMR","ITW","PH",
-  // Growth / Cloud
-  "NFLX","SPOT","UBER","LYFT","ABNB","DASH","SNAP","PINS",
-  "PLTR","SNOW","DDOG","NET","ZS","CRWD","PANW","OKTA","S",
-  "SHOP","MELI","SE","GRAB","BABA","JD","PDD","BIDU",
-  // ETFs commonly mentioned
-  "SPY","QQQ","IWM","DIA","XLK","SMH","PAVE","XLI","ICLN",
-]);
-
-function extractTickers(text) {
-  if (!text) return [];
-  const matches = text.match(/\b[A-Z]{1,5}\b/g) || [];
-  return [...new Set(matches.filter(m => KNOWN_TICKERS.has(m)))].slice(0, 3);
-}
