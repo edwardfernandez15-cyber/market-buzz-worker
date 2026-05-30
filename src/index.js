@@ -3,17 +3,18 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // CORS so your Pages site can call this
     const cors = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET,OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type",
     };
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: cors });
+    if (request.method === "OPTIONS") return new Response(null, { headers: cors });
+
+    if (path === "/health") {
+      return json({ ok: true, service: "market-buzz-api", ts: Date.now() }, 200, cors);
     }
 
-    // ✅ LIVE QUOTE: /api/quote?symbol=AMZN
+    // /api/quote?symbol=AMZN
     if (path === "/api/quote") {
       const symbol = (url.searchParams.get("symbol") || "").toUpperCase().trim();
       if (!symbol) return json({ error: "Missing symbol" }, 400, cors);
@@ -25,6 +26,10 @@ export default {
         `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${token}`
       );
       const d = await r.json();
+
+      if (!d || typeof d.c !== "number" || d.c === 0) {
+        return json({ error: "Symbol not found or no price data", symbol }, 404, cors);
+      }
 
       return json(
         {
@@ -43,7 +48,7 @@ export default {
       );
     }
 
-    // ✅ LIVE NEWS: /api/news?q=Amazon
+    // /api/news?q=Amazon
     if (path === "/api/news") {
       const q = (url.searchParams.get("q") || "").trim();
       if (!q) return json({ error: "Missing q" }, 400, cors);
@@ -70,7 +75,7 @@ export default {
       return json(items, 200, cors);
     }
 
-    // ✅ LIVE FEED: /api/feed
+    // /api/feed
     if (path === "/api/feed") {
       const now = Date.now();
       return json(
@@ -91,8 +96,11 @@ export default {
       );
     }
 
-    // default
-    return json({ ok: true, message: "Market Buzz API online", routes: ["/api/quote", "/api/news", "/api/feed"] }, 200, cors);
+    return json(
+      { ok: true, message: "Market Buzz API online", routes: ["/api/quote", "/api/news", "/api/feed"] },
+      200,
+      cors
+    );
   },
 };
 
