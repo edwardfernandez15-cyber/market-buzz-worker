@@ -1,1 +1,3 @@
-wrangler.toml
+name = "market-buzz-api"
+main = "src/index.js"
+compatibility_date = "2026-05-30"
