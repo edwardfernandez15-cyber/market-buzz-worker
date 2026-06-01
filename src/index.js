@@ -6,7 +6,6 @@
  *   GET /api/news?category=general          — Finnhub market news
  *   GET /api/stock-news?symbol=AAPL&from=…&to=…  — Finnhub company news
  *   GET /api/fred?series_id=FEDFUNDS&limit=1&sort_order=desc&units=pc1
- *   GET /api/ecocal?from=YYYY-MM-DD&to=YYYY-MM-DD — Finnhub economic calendar
  *
  * Required secrets (set in CF Workers → Settings → Variables):
  *   FINNHUB_API_KEY
@@ -32,9 +31,6 @@ export default {
     }
     if (path === '/api/fred') {
       return handleFred(url, env);
-    }
-    if (path === '/api/ecocal') {
-      return handleEcoCal(url, env);
     }
 
     return jsonError('Not found', 404);
@@ -137,33 +133,37 @@ async function handleFred(url, env) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-//  /api/ecocal?from=YYYY-MM-DD&to=YYYY-MM-DD
-// ────────────────────────────────────────────────────────────────────────────
-async function handleEcoCal(url, env) {
-  if (!env.FINNHUB_API_KEY) {
-    return jsonError('FINNHUB_API_KEY is not set', 500);
-  }
-
-  const now   = new Date();
-  const sixMo = new Date(now.getTime() + 180 * 86400000);
-  const from  = url.searchParams.get('from') || now.toISOString().slice(0, 10);
-  const to    = url.searchParams.get('to')   || sixMo.toISOString().slice(0, 10);
-
-  const upstream = `https://finnhub.io/api/v1/calendar/economic`
-    + `?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`
-    + `&token=${env.FINNHUB_API_KEY}`;
-
-  try {
-    const resp = await fetch(upstream, { headers: { 'User-Agent': 'MarketBuzzHub/1.0' } });
-    if (!resp.ok) return jsonError(`Finnhub error: ${resp.status} ${resp.statusText}`, resp.status);
-    const data = await resp.json();
-    const events = Array.isArray(data) ? data : (data.economicCalendar || []);
-    return jsonOk(events, 3600); // 1-hour cache
-  } catch (e) {
-    return jsonError(e.message, 502);
-  }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
 //  Helpers
 // ────────────────────────────────────────────────────────────────────────────
+function jsonOk(data, maxAge = 0) {
+  return new Response(JSON.stringify(data), {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      'Cache-Control': `public, max-age=${maxAge}`,
+    },
+  });
+}
+
+function jsonError(msg, status = 500) {
+  return new Response(JSON.stringify({ error: msg }), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    },
+  });
+}
+
+function corsResponse(body, status = 200) {
+  return new Response(body, {
+    status,
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    },
+  });
+}
