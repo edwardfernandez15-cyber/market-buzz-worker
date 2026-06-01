@@ -1,15 +1,7 @@
 name = "market-buzz-api"
-main = "index.js"
+main = "src/index.js"
 compatibility_date = "2024-01-01"
 
-[observability]
-enabled = true
-
-# Worker Routes — makes the API available on YOUR own domain.
-# Cloudflare Worker Routes take priority over Pages on matching paths.
-# After `npx wrangler deploy`, these routes are registered automatically.
 routes = [
-  { pattern = "www.financeninja.work/stock*",   zone_name = "financeninja.work" },
-  { pattern = "www.financeninja.work/api/*",    zone_name = "financeninja.work" },
-  { pattern = "www.financeninja.work/health*",  zone_name = "financeninja.work" },
+  { pattern = "www.financeninja.work/api/*", zone_name = "financeninja.work" },
 ]
