@@ -27,12 +27,14 @@ export default {
     }
 
     // ── Route dispatcher ───────────────────────────────────────────────────
-    if (path === '/api/news')       return handleMarketNews(url, env);
-    if (path === '/api/stock-news') return handleStockNews(url, env);
-    if (path === '/api/fred')       return handleFred(url, env);
-    if (path === '/api/ecocal')     return handleEcoCal(url, env);
-    if (path === '/api/earnings')   return handleEarnings(url, env);
-    if (path === '/api/all')        return handleAll(url, env);
+    if (path === '/api/news')              return handleMarketNews(url, env);
+    if (path === '/api/stock-news')        return handleStockNews(url, env);
+    if (path === '/api/fred')              return handleFred(url, env);
+    if (path === '/api/ecocal')            return handleEcoCal(url, env);
+    if (path === '/api/earnings')          return handleEarnings(url, env);
+    if (path === '/api/all')               return handleAll(url, env);
+    if (path === '/api/sector-etfs/quote') return handleSectorQuote(url, env);
+    if (path === '/api/sector-etfs/candle')return handleSectorCandle(url, env);
 
     return jsonError('Not found', 404);
   },
@@ -333,6 +335,53 @@ function formatNewsItems(raw) {
 }
 
 function noop() { return Promise.resolve(null); }
+
+// ────────────────────────────────────────────────────────────────────────────
+//  /api/sector-etfs/quote?symbol=XLK   — Finnhub real-time quote for one ETF
+// ────────────────────────────────────────────────────────────────────────────
+async function handleSectorQuote(url, env) {
+  if (!env.FINNHUB_API_KEY) return jsonError('FINNHUB_API_KEY not set', 500);
+  const symbol = url.searchParams.get('symbol');
+  if (!symbol) return jsonError('Missing symbol', 400);
+
+  const upstream = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${env.FINNHUB_API_KEY}`;
+  try {
+    const resp = await fetch(upstream, { headers: { 'User-Agent': 'MarketBuzzHub/1.0' } });
+    if (!resp.ok) return jsonError(`Finnhub ${resp.status}`, resp.status);
+    const d = await resp.json();
+    // c=current, pc=prev close, dp=day%, h=high, l=low, o=open
+    return jsonOk({ c: d.c, pc: d.pc, dp: d.dp, h: d.h, l: d.l, o: d.o }, 300);
+  } catch (e) {
+    return jsonError(e.message, 502);
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+//  /api/sector-etfs/candle?symbol=XLK&from=<unix>&to=<unix>
+//  Returns daily OHLCV candles — used to compute MTD % from month-open price
+// ────────────────────────────────────────────────────────────────────────────
+async function handleSectorCandle(url, env) {
+  if (!env.FINNHUB_API_KEY) return jsonError('FINNHUB_API_KEY not set', 500);
+  const symbol = url.searchParams.get('symbol');
+  const from   = url.searchParams.get('from');
+  const to     = url.searchParams.get('to');
+  if (!symbol || !from || !to) return jsonError('Missing symbol, from, or to', 400);
+
+  const upstream =
+    `https://finnhub.io/api/v1/stock/candle` +
+    `?symbol=${encodeURIComponent(symbol)}` +
+    `&resolution=D&from=${from}&to=${to}` +
+    `&token=${env.FINNHUB_API_KEY}`;
+  try {
+    const resp = await fetch(upstream, { headers: { 'User-Agent': 'MarketBuzzHub/1.0' } });
+    if (!resp.ok) return jsonError(`Finnhub ${resp.status}`, resp.status);
+    const d = await resp.json();
+    if (d.s !== 'ok') return jsonError('No candle data', 404);
+    return jsonOk({ o: d.o, c: d.c, h: d.h, l: d.l, t: d.t }, 900);
+  } catch (e) {
+    return jsonError(e.message, 502);
+  }
+}
 
 // ── Response helpers ─────────────────────────────────────────────────────────
 function jsonOk(data, maxAge = 0) {
