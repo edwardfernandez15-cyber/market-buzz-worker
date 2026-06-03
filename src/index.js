@@ -1,264 +1,169 @@
 /**
- * MACRO OUTLOOK — Cloudflare Worker
- * ─────────────────────────────────────────────────────────────────
- * Proxies all API calls so secret keys stay server-side.
+ * market-buzz-worker — Cloudflare Worker
+ * Proxies FRED and Finnhub APIs to avoid browser CORS restrictions.
  *
- * DEPLOY STEPS:
- *   1. Go to dash.cloudflare.com → Workers & Pages → Create
- *   2. Paste this file, click Save & Deploy
- *   3. In the Worker Settings → Variables & Secrets, bind:
- *       BEA_API_KEY, BLS_API_KEY, CENSUS_API_KEY, EIA_API_KEY,
- *       FINNHUB_API_KEY, FRED_API_KEY, NEWSAPI_KEY, TIPRANKS_API_KEY
- *   4. Copy the worker URL (e.g. https://macro-data.yourname.workers.dev)
- *   5. Paste it into WORKER_URL in usa_macro_outlook_trend_analysis.html
+ * Endpoint paths match what index.html calls:
+ *   GET /api/news?category=general          — Finnhub market news
+ *   GET /api/stock-news?symbol=AAPL&from=…&to=…  — Finnhub company news
+ *   GET /api/fred?series_id=FEDFUNDS&limit=1&sort_order=desc&units=pc1
  *
- * ENDPOINTS:
- *   GET /api/all     — all categories in one call (used by the HTML)
- *   GET /api/energy  — EIA + FRED energy prices & storage
- *   GET /api/macro   — FRED macroeconomic indicators
- *   GET /api/market  — Finnhub equities & volatility
- *   GET /api/labor   — BLS payrolls & claims
- *   GET /api/news    — NewsAPI top business headlines
+ * Required secrets (set in CF Workers → Settings → Variables):
+ *   FINNHUB_API_KEY
+ *   FRED_API_KEY
  */
 
 export default {
   async fetch(request, env) {
-    const url  = new URL(request.url);
-    const cors = {
-      'Access-Control-Allow-Origin': '*',
-      'Content-Type': 'application/json',
-      'Cache-Control': 'public, max-age=900',   // 15 min CDN cache
-    };
-
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET', 'Access-Control-Max-Age': '86400' }
-      });
-    }
-
+    const url = new URL(request.url);
     const path = url.pathname;
 
-    try {
-      let body;
-
-      if (path === '/api/all' || path === '/api/data') {
-        const [en, mac, mkt, news] = await Promise.allSettled([
-          fetchEnergy(env),
-          fetchMacro(env),
-          fetchMarket(env),
-          fetchNews(env),
-        ]);
-        body = {
-          energy:      en.status   === 'fulfilled' ? en.value   : {},
-          macro:       mac.status  === 'fulfilled' ? mac.value  : {},
-          market:      mkt.status  === 'fulfilled' ? mkt.value  : {},
-          news:        news.status === 'fulfilled' ? news.value : [],
-          lastUpdated: new Date().toISOString(),
-        };
-      } else if (path === '/api/energy') {
-        body = await fetchEnergy(env);
-      } else if (path === '/api/macro') {
-        body = await fetchMacro(env);
-      } else if (path === '/api/market') {
-        body = await fetchMarket(env);
-      } else if (path === '/api/labor') {
-        body = await fetchLabor(env);
-      } else if (path === '/api/news') {
-        body = await fetchNews(env);
-      } else {
-        return new Response(JSON.stringify({ error: 'Not found', routes: ['/api/all', '/api/energy', '/api/macro', '/api/market', '/api/labor', '/api/news'] }), { status: 404, headers: cors });
-      }
-
-      return new Response(JSON.stringify(body), { headers: cors });
-    } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: cors });
+    // ── CORS preflight ───────────────────────────────────────────────────────
+    if (request.method === 'OPTIONS') {
+      return corsResponse('', 204);
     }
-  }
+
+    // ── Route dispatcher ─────────────────────────────────────────────────────
+    if (path === '/api/news') {
+      return handleMarketNews(url, env);
+    }
+    if (path === '/api/stock-news') {
+      return handleStockNews(url, env);
+    }
+    if (path === '/api/fred') {
+      return handleFred(url, env);
+    }
+
+    return jsonError('Not found', 404);
+  },
 };
 
-// ─────────────────────────────────────────────────────────────────
-// ENERGY  (FRED for spot prices, EIA for gas storage)
-// ─────────────────────────────────────────────────────────────────
-async function fetchEnergy(env) {
-  const FRED = env.FRED_API_KEY;
-  const EIA  = env.EIA_API_KEY;
-
-  // FRED series: Brent (DCOILBRENTEU), WTI (DCOILWTICO), Henry Hub (DHHNGSP)
-  const fredBase = `https://api.stlouisfed.org/fred/series/observations?api_key=${FRED}&file_type=json&sort_order=desc&limit=3`;
-  const [brentR, wtiR, hhR, storageR] = await Promise.allSettled([
-    fetch(`${fredBase}&series_id=DCOILBRENTEU`).then(r => r.json()),
-    fetch(`${fredBase}&series_id=DCOILWTICO`).then(r => r.json()),
-    fetch(`${fredBase}&series_id=DHHNGSP`).then(r => r.json()),
-    // EIA weekly natural gas storage (Lower 48, Bcf)
-    fetch(`https://api.eia.gov/v2/natural-gas/stor/wkly/data/?api_key=${EIA}&facets[duoarea][]=NUS&facets[process][]=SAB&frequency=weekly&sort[0][column]=period&sort[0][direction]=desc&length=6`).then(r => r.json()),
-  ]);
-
-  function latestFred(res) {
-    if (res.status !== 'fulfilled') return null;
-    const obs = (res.value?.observations || []).filter(o => o.value !== '.' && o.value !== 'NA');
-    return obs[0]?.value ?? null;
+// ────────────────────────────────────────────────────────────────────────────
+//  /api/news?category=general
+// ────────────────────────────────────────────────────────────────────────────
+async function handleMarketNews(url, env) {
+  if (!env.FINNHUB_API_KEY) {
+    return jsonError('FINNHUB_API_KEY is not set', 500);
   }
 
-  // Storage: show current Bcf + week-over-week change
-  let storageStr = null;
-  if (storageR.status === 'fulfilled') {
-    const rows = storageR.value?.response?.data || [];
-    if (rows.length >= 2) {
-      const cur  = parseFloat(rows[0]?.value);
-      const prev = parseFloat(rows[1]?.value);
-      const wow  = Math.round(cur - prev);
-      storageStr = `${(cur / 1000).toFixed(2)} Tcf (${wow >= 0 ? '+' : ''}${wow} Bcf WoW)`;
-    } else if (rows.length === 1) {
-      storageStr = `${(parseFloat(rows[0].value) / 1000).toFixed(2)} Tcf`;
-    }
-  }
+  const category = url.searchParams.get('category') || 'general';
+  const minId    = url.searchParams.get('minId')    || '0';
 
-  return {
-    brent:    latestFred(brentR),
-    wti:      latestFred(wtiR),
-    henryHub: latestFred(hhR),
-    storage:  storageStr,
-  };
+  const upstream = `https://finnhub.io/api/v1/news`
+    + `?category=${encodeURIComponent(category)}`
+    + `&minId=${minId}`
+    + `&token=${env.FINNHUB_API_KEY}`;
+
+  try {
+    const resp = await fetch(upstream, { headers: { 'User-Agent': 'MarketBuzzHub/1.0' } });
+    if (!resp.ok) return jsonError(`Finnhub error: ${resp.status} ${resp.statusText}`, resp.status);
+    const data = await resp.json();
+    return jsonOk(data, 300); // 5-min cache
+  } catch (e) {
+    return jsonError(e.message, 502);
+  }
 }
 
-// ─────────────────────────────────────────────────────────────────
-// MACRO  (FRED)
-// ─────────────────────────────────────────────────────────────────
-async function fetchMacro(env) {
-  const KEY  = env.FRED_API_KEY;
-  const base = `https://api.stlouisfed.org/fred/series/observations?api_key=${KEY}&file_type=json&sort_order=desc`;
+// ────────────────────────────────────────────────────────────────────────────
+//  /api/stock-news?symbol=AAPL&from=YYYY-MM-DD&to=YYYY-MM-DD
+// ────────────────────────────────────────────────────────────────────────────
+async function handleStockNews(url, env) {
+  if (!env.FINNHUB_API_KEY) {
+    return jsonError('FINNHUB_API_KEY is not set', 500);
+  }
 
-  // series_id → output key
-  const series = {
-    UNRATE:      'unemployment',   // Unemployment rate, %
-    DGS10:       'tenYear',        // 10-yr Treasury yield
-    UMCSENT:     'michigan',       // U of Michigan Consumer Sentiment
-    MORTGAGE30US:'mortgage',       // 30-yr fixed mortgage rate
-    PSAVERT:     'savingRate',     // Personal saving rate
-    PCEPILFE:    'corePCE',        // Core PCE Price Index (use units=pc1 for YoY%)
-    ICSA:        'claims',         // Initial jobless claims (weekly)
-    PAYEMS:      'payrollsLevel',  // Total nonfarm payroll, thousands
-    FEDFUNDS:    'fedFunds',       // Federal funds effective rate
-  };
+  const symbol = url.searchParams.get('symbol');
+  if (!symbol) return jsonError('Missing required param: symbol', 400);
 
-  const jobs = Object.entries(series).map(([sid, key]) => {
-    // For Core PCE request YoY % change transformation
-    const extra = sid === 'PCEPILFE' ? '&units=pc1' : '';
-    return fetch(`${base}&series_id=${sid}&limit=2${extra}`)
-      .then(r => r.json())
-      .then(d => {
-        const obs = (d.observations || []).filter(o => o.value !== '.' && o.value !== 'NA');
-        return { key, latest: obs[0]?.value ?? null, prev: obs[1]?.value ?? null, date: obs[0]?.date ?? null };
-      });
+  const toDate   = url.searchParams.get('to')   || new Date().toISOString().slice(0, 10);
+  const fromDate = url.searchParams.get('from') || new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+
+  const upstream = `https://finnhub.io/api/v1/company-news`
+    + `?symbol=${encodeURIComponent(symbol)}`
+    + `&from=${fromDate}`
+    + `&to=${toDate}`
+    + `&token=${env.FINNHUB_API_KEY}`;
+
+  try {
+    const resp = await fetch(upstream, { headers: { 'User-Agent': 'MarketBuzzHub/1.0' } });
+    if (!resp.ok) return jsonError(`Finnhub error: ${resp.status} ${resp.statusText}`, resp.status);
+    const data = await resp.json();
+    return jsonOk(data, 300); // 5-min cache
+  } catch (e) {
+    return jsonError(e.message, 502);
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+//  /api/fred?series_id=FEDFUNDS&limit=1&sort_order=desc[&units=pc1]
+//            [&observation_start=YYYY-MM-DD][&observation_end=YYYY-MM-DD]
+// ────────────────────────────────────────────────────────────────────────────
+async function handleFred(url, env) {
+  if (!env.FRED_API_KEY) {
+    return jsonError('FRED_API_KEY is not set', 500);
+  }
+
+  const seriesId  = url.searchParams.get('series_id');
+  if (!seriesId) return jsonError('Missing required param: series_id', 400);
+
+  const limit     = url.searchParams.get('limit')      || '1';
+  const sortOrder = url.searchParams.get('sort_order') || 'desc';
+  const units     = url.searchParams.get('units')      || '';
+  const obsStart  = url.searchParams.get('observation_start') || '';
+  const obsEnd    = url.searchParams.get('observation_end')   || '';
+
+  let fredUrl = `https://api.stlouisfed.org/fred/series/observations`
+    + `?series_id=${encodeURIComponent(seriesId)}`
+    + `&api_key=${env.FRED_API_KEY}`
+    + `&file_type=json`
+    + `&sort_order=${sortOrder}`
+    + `&limit=${limit}`;
+
+  if (units)    fredUrl += `&units=${encodeURIComponent(units)}`;
+  if (obsStart) fredUrl += `&observation_start=${obsStart}`;
+  if (obsEnd)   fredUrl += `&observation_end=${obsEnd}`;
+
+  try {
+    const resp = await fetch(fredUrl, { headers: { 'User-Agent': 'MarketBuzzHub/1.0' } });
+    if (!resp.ok) return jsonError(`FRED error: ${resp.status} ${resp.statusText}`, resp.status);
+    const data = await resp.json();
+    return jsonOk(data, 3600); // 1-hour cache — macro data doesn't move minute-to-minute
+  } catch (e) {
+    return jsonError(e.message, 502);
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+//  Helpers
+// ────────────────────────────────────────────────────────────────────────────
+function jsonOk(data, maxAge = 0) {
+  return new Response(JSON.stringify(data), {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      'Cache-Control': `public, max-age=${maxAge}`,
+    },
   });
-
-  const results = await Promise.allSettled(jobs);
-  const data = {};
-
-  for (const r of results) {
-    if (r.status !== 'fulfilled' || !r.value.latest) continue;
-    const { key, latest, prev } = r.value;
-    data[key] = latest;
-    // Monthly payroll change (thousands)
-    if (key === 'payrollsLevel' && prev) {
-      data.payrollChg = Math.round(parseFloat(latest) - parseFloat(prev));
-    }
-  }
-
-  // BEA: GDP current quarter (use FRED proxy series GDPC1 for real GDP growth)
-  try {
-    const gdpRes = await fetch(`${base}&series_id=GDPC1&limit=2`).then(r => r.json());
-    const obs = (gdpRes.observations || []).filter(o => o.value !== '.' && o.value !== 'NA');
-    if (obs.length >= 2) {
-      const cur  = parseFloat(obs[0].value);
-      const prev = parseFloat(obs[1].value);
-      // Annualised QoQ %
-      data.gdpQoQ = ((cur / prev - 1) * 400).toFixed(1);
-    }
-  } catch(_) {}
-
-  return data;
 }
 
-// ─────────────────────────────────────────────────────────────────
-// MARKET  (Finnhub)
-// ─────────────────────────────────────────────────────────────────
-async function fetchMarket(env) {
-  const KEY = env.FINNHUB_API_KEY;
-  const hdr = { 'X-Finnhub-Token': KEY };
-
-  const [spyR, vixR] = await Promise.allSettled([
-    fetch('https://finnhub.io/api/v1/quote?symbol=SPY',  { headers: hdr }).then(r => r.json()),
-    fetch('https://finnhub.io/api/v1/quote?symbol=UVXY', { headers: hdr }).then(r => r.json()),
-  ]);
-
-  const spy = spyR.status === 'fulfilled' ? spyR.value : null;
-  const vix = vixR.status === 'fulfilled' ? vixR.value : null;
-
-  // SPY * ~10.01 ≈ S&P 500 level (approximate)
-  const spxLevel     = spy?.c  ? Math.round(spy.c * 10.01)  : null;
-  const spxChangePct = spy?.dp ? parseFloat(spy.dp.toFixed(2)) : null;
-
-  return {
-    spyPrice:     spy?.c    ?? null,
-    spxLevel,
-    spxChangePct,
-    spxHigh:      spy?.h    ? Math.round(spy.h * 10.01) : null,
-    spxLow:       spy?.l    ? Math.round(spy.l * 10.01) : null,
-    vix:          vix?.c    ?? null,
-  };
+function jsonError(msg, status = 500) {
+  return new Response(JSON.stringify({ error: msg }), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    },
+  });
 }
 
-// ─────────────────────────────────────────────────────────────────
-// LABOR  (BLS API v2) — standalone endpoint
-// ─────────────────────────────────────────────────────────────────
-async function fetchLabor(env) {
-  const KEY = env.BLS_API_KEY;
-  const payload = {
-    seriesid:        ['CES0000000001', 'LNS14000000', 'ICSA'],
-    registrationkey: KEY,
-    latest:          true,
-  };
-
-  try {
-    const res = await fetch('https://api.bls.gov/publicAPI/v2/timeseries/data/', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(payload),
-    }).then(r => r.json());
-
-    const out = {};
-    for (const s of (res?.Results?.series || [])) {
-      const val = s.data?.[0]?.value;
-      if (s.seriesID === 'CES0000000001') out.totalNonfarm = val;
-      if (s.seriesID === 'LNS14000000')  out.unemployment = val;
-      if (s.seriesID === 'ICSA')         out.initialClaims = val;
-    }
-    return out;
-  } catch(e) {
-    return { error: e.message };
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────
-// NEWS  (NewsAPI)
-// ─────────────────────────────────────────────────────────────────
-async function fetchNews(env) {
-  const KEY = env.NEWSAPI_KEY;
-  const url = `https://newsapi.org/v2/top-headlines?category=business&country=us&pageSize=6&apiKey=${KEY}`;
-
-  try {
-    const res = await fetch(url).then(r => r.json());
-    return (res.articles || [])
-      .filter(a => a.title && a.title !== '[Removed]')
-      .slice(0, 5)
-      .map(a => ({
-        title:       a.title,
-        url:         a.url,
-        source:      a.source?.name,
-        publishedAt: a.publishedAt,
-      }));
-  } catch(e) {
-    return [];
-  }
+function corsResponse(body, status = 200) {
+  return new Response(body, {
+    status,
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    },
+  });
 }
