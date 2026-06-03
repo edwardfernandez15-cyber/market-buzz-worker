@@ -1,11 +1,7 @@
 name = "market-buzz-api"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
-{
-  "observability": {
-    "enabled": false
-  }
-}
+
 routes = [
   { pattern = "www.financeninja.work/api/*", zone_name = "financeninja.work" },
 ]
