@@ -114,6 +114,7 @@ async function handleFred(url, env) {
     `&file_type=json` +
     `&sort_order=${sortOrder}` +
     `&limit=${limit}`;
+
   if (units)    fredUrl += `&units=${encodeURIComponent(units)}`;
   if (obsStart) fredUrl += `&observation_start=${obsStart}`;
   if (obsEnd)   fredUrl += `&observation_end=${obsEnd}`;
@@ -214,13 +215,24 @@ async function handleAll(url, env) {
 
   // Fire all upstream calls in parallel
   const [
-    brentRes, wtiRes, hhRes,
-    unrateRes, corePceRes, michiganRes,
-    mortgageRes, payemsRes, icsaRes,
-    gdpRes, sp500Res, newsRes,
+    brentRes,
+    wtiRes,
+    hhRes,
+    unrateRes,
+    corePceRes,
+    michiganRes,
+    mortgageRes,
+    payemsRes,
+    icsaRes,
+    gdpRes,
+    sp500Res,
+    newsRes,
+    djiaRes,
+    goldRes,
+    dgs10Res,
   ] = await Promise.allSettled([
-    hasFred    ? fredLatest('DCOILBRENTEU',    env, 1)         : noop(),
-    hasFred    ? fredLatest('DCOILWTICO',      env, 1)         : noop(),
+    hasFred    ? fredLatest('DCOILBRENTEU',    env, 2)         : noop(),
+    hasFred    ? fredLatest('DCOILWTICO',      env, 2)         : noop(),
     hasFred    ? fredLatest('DHHNGSP',         env, 1)         : noop(),
     hasFred    ? fredLatest('UNRATE',          env, 1)         : noop(),
     hasFred    ? fredLatest('PCEPILFE',        env, 1, 'pc1')  : noop(),
@@ -231,6 +243,9 @@ async function handleAll(url, env) {
     hasFred    ? fredLatest('A191RL1Q225SBEA', env, 1)         : noop(),
     hasFred    ? fredLatest('SP500',           env, 2)         : noop(),  // level; diff → chg%
     hasFinnhub ? fetchFinnhubNews('general',   env)            : noop(),
+    hasFred    ? fredLatest('DJIA',            env, 10)        : noop(),  // wider lookback for holidays/weekends
+    goldLatest(env),                                                // Spot Gold/USD → FRED PM Fix → FRED AM Fix
+    hasFred    ? fredLatest('DGS10',           env, 2)         : noop(),
   ]);
 
   const get = r => (r.status === 'fulfilled' ? r.value : null);
@@ -241,38 +256,94 @@ async function handleAll(url, env) {
     const n = parseFloat(v);
     return Number.isFinite(n) ? n : null;
   };
+
   const strV = obs => {
     const v = Array.isArray(obs) ? obs[0]?.value : obs?.value;
     return v && v !== '.' ? v : null;
   };
 
+  const levelAndChg = arr => {
+    if (!Array.isArray(arr) || !arr.length) return [null, null];
+
+    const l = parseFloat(arr[0].value);
+    const p = arr.length > 1 ? parseFloat(arr[1].value) : null;
+
+    const level = Number.isFinite(l) ? l : null;
+
+    const chg = (
+      level != null &&
+      Number.isFinite(p) &&
+      p > 0
+    )
+      ? ((l - p) / p) * 100
+      : null;
+
+    return [level, chg];
+  };
+
+  const pctChg = arr => {
+    if (!Array.isArray(arr) || arr.length < 2) return null;
+
+    const l = parseFloat(arr[0].value);
+    const p = parseFloat(arr[1].value);
+
+    return Number.isFinite(l) && Number.isFinite(p) && p > 0
+      ? ((l - p) / p) * 100
+      : null;
+  };
+
   // Payroll MoM change (PAYEMS is job-level in thousands)
   let payrollChg = null;
   const payArr = get(payemsRes);
+
   if (Array.isArray(payArr) && payArr.length >= 2) {
-    const a = parseFloat(payArr[0].value), b = parseFloat(payArr[1].value);
-    if (Number.isFinite(a) && Number.isFinite(b)) payrollChg = a - b;
+    const a = parseFloat(payArr[0].value);
+    const b = parseFloat(payArr[1].value);
+
+    if (Number.isFinite(a) && Number.isFinite(b)) {
+      payrollChg = a - b;
+    }
   }
 
-  // S&P 500 level + day % change
-  let spxLevel = null, spxChangePct = null;
-  const spArr = get(sp500Res);
-  if (Array.isArray(spArr) && spArr.length >= 2) {
-    const l = parseFloat(spArr[0].value), p = parseFloat(spArr[1].value);
-    if (Number.isFinite(l)) spxLevel = l;
-    if (Number.isFinite(l) && Number.isFinite(p) && p > 0)
-      spxChangePct = ((l - p) / p) * 100;
-  } else if (Array.isArray(spArr) && spArr.length === 1) {
-    spxLevel = parseFloat(spArr[0].value);
+  // Market levels + changes
+  const [spxLevel, spxChangePct] = levelAndChg(get(sp500Res));
+  const [dowLevel, dowChangePct] = levelAndChg(get(djiaRes));
+
+  // Gold comes back as a normalized object from goldLatest()
+  const goldQuote     = get(goldRes);
+  const goldPrice     = goldQuote?.price ?? null;
+  const goldChangePct = goldQuote?.changePct ?? null;
+  const goldSource    = goldQuote?.source ?? null;
+  const goldAsOf      = goldQuote?.date ?? null;
+
+  // 10-year Treasury yield level + absolute change in percentage points
+  let yield10 = null;
+  let yield10Chg = null;
+  const dgs10Arr = get(dgs10Res);
+
+  if (Array.isArray(dgs10Arr) && dgs10Arr.length) {
+    yield10 = parseFloat(dgs10Arr[0].value);
+
+    if (dgs10Arr.length > 1) {
+      const prevYield10 = parseFloat(dgs10Arr[1].value);
+
+      if (Number.isFinite(yield10) && Number.isFinite(prevYield10)) {
+        yield10Chg = +(yield10 - prevYield10).toFixed(3);
+      }
+    }
   }
 
-  const news = formatNewsItems(get(newsRes));
+  const brentArr = get(brentRes);
+  const wtiArr   = get(wtiRes);
+  const news     = formatNewsItems(get(newsRes));
 
   return jsonOk({
     energy: {
-      brent:    numV(get(brentRes)),
-      wti:      numV(get(wtiRes)),
-      henryHub: numV(get(hhRes)),
+      brent:          numV(brentArr),
+      wti:            numV(wtiArr),
+      henryHub:       numV(get(hhRes)),
+      brentChangePct: pctChg(brentArr),
+      wtiChangePct:   pctChg(wtiArr),
     },
     macro: {
       unemployment: strV(get(unrateRes)),
@@ -287,11 +358,23 @@ async function handleAll(url, env) {
       payrollChangeThousands: payrollChg,
       unemploymentRate:       strV(get(unrateRes)),
     },
-    market: { spxLevel, spxChangePct },
+    market: {
+      spxLevel,
+      spxChangePct,
+      dowLevel,
+      dowChangePct,
+      goldPrice,
+      goldChangePct,
+      goldSource,
+      goldAsOf,
+      yield10,
+      yield10Chg,
+    },
     news,
     lastUpdated: new Date().toISOString(),
   }, 900); // 15-min cache
 }
+
 
 // ── FRED sub-helpers ─────────────────────────────────────────────────────────
 /**
@@ -300,6 +383,7 @@ async function handleAll(url, env) {
  */
 async function fredLatest(seriesId, env, limit = 1, units = '') {
   const unitsParam = units ? `&units=${encodeURIComponent(units)}` : '';
+
   const fredUrl =
     `https://api.stlouisfed.org/fred/series/observations` +
     `?series_id=${encodeURIComponent(seriesId)}` +
@@ -307,23 +391,226 @@ async function fredLatest(seriesId, env, limit = 1, units = '') {
     `&file_type=json&sort_order=desc` +
     `&limit=${limit}` +
     unitsParam;
+
   const resp = await fetch(fredUrl, { headers: { 'User-Agent': 'MarketBuzzHub/1.0' } });
-  if (!resp.ok) throw new Error(`FRED ${seriesId}: HTTP ${resp.status}`);
+
+  if (!resp.ok) {
+    throw new Error(`FRED ${seriesId}: HTTP ${resp.status}`);
+  }
+
   const data  = await resp.json();
+
   const valid = (data.observations || []).filter(o => o.value && o.value !== '.');
+
   return limit === 1 ? (valid[0] ?? null) : valid;
 }
 
+
+// ── Gold sub-helpers ─────────────────────────────────────────────────────────
+/**
+ * Gold fallback chain:
+ *   1. Spot Gold/USD via Yahoo chart symbol XAUUSD=X
+ *   2. FRED Gold PM Fix via GOLDPMGBD228NLBM
+ *   3. FRED Gold AM Fix via GOLDAMGBD228NLBM
+ *
+ * Returns a normalized quote object:
+ *   { symbol, name, price, changePct, date, source }
+ */
+async function goldLatest(env) {
+  const sources = [
+    {
+      name: 'Spot Gold/USD',
+      symbol: 'XAUUSD=X',
+      fn: () => yahooChartLatest('XAUUSD=X'),
+    },
+    {
+      name: 'FRED Gold PM Fix',
+      symbol: 'GOLDPMGBD228NLBM',
+      fn: () => env.FRED_API_KEY
+        ? fredLatest('GOLDPMGBD228NLBM', env, 20)
+        : null,
+    },
+    {
+      name: 'FRED Gold AM Fix',
+      symbol: 'GOLDAMGBD228NLBM',
+      fn: () => env.FRED_API_KEY
+        ? fredLatest('GOLDAMGBD228NLBM', env, 20)
+        : null,
+    },
+  ];
+
+  for (const source of sources) {
+    try {
+      const raw = await source.fn();
+      const quote = normalizeGoldQuote(raw, source);
+
+      if (quote) return quote;
+    } catch (e) {
+      console.warn(`Gold source failed: ${source.name}`, e?.message || e);
+    }
+  }
+
+  return {
+    symbol: 'GOLD',
+    name: 'Gold',
+    price: null,
+    changePct: null,
+    date: null,
+    source: 'Unavailable',
+  };
+}
+
+/**
+ * Pulls a latest-ish spot gold quote from Yahoo's chart endpoint.
+ * No API key required. If it fails, goldLatest() falls back to FRED.
+ */
+async function yahooChartLatest(symbol) {
+  const yahooUrl =
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}` +
+    `?range=5d&interval=5m`;
+
+  const resp = await fetch(yahooUrl, {
+    headers: { 'User-Agent': 'MarketBuzzHub/1.0' },
+  });
+
+  if (!resp.ok) {
+    throw new Error(`Yahoo ${symbol}: HTTP ${resp.status}`);
+  }
+
+  const data = await resp.json();
+  const result = data?.chart?.result?.[0];
+
+  if (!result) {
+    throw new Error(`Yahoo ${symbol}: no chart result`);
+  }
+
+  const meta       = result.meta || {};
+  const quote      = result.indicators?.quote?.[0] || {};
+  const closes     = quote.close || [];
+  const timestamps = result.timestamp || [];
+
+  let price = Number(meta.regularMarketPrice);
+  let priceTimeMs = Number(meta.regularMarketTime)
+    ? Number(meta.regularMarketTime) * 1000
+    : Date.now();
+
+  // If meta price is missing, use the latest valid close in the chart.
+  if (!Number.isFinite(price) || price <= 0) {
+    for (let i = closes.length - 1; i >= 0; i--) {
+      const close = Number(closes[i]);
+
+      if (Number.isFinite(close) && close > 0) {
+        price = close;
+
+        if (timestamps[i]) {
+          priceTimeMs = timestamps[i] * 1000;
+        }
+
+        break;
+      }
+    }
+  }
+
+  if (!Number.isFinite(price) || price <= 0) {
+    throw new Error(`Yahoo ${symbol}: invalid price`);
+  }
+
+  const previousClose = Number(
+    meta.previousClose ??
+    meta.chartPreviousClose
+  );
+
+  const changePct =
+    Number.isFinite(previousClose) && previousClose > 0
+      ? ((price - previousClose) / previousClose) * 100
+      : null;
+
+  return {
+    symbol,
+    name: 'Gold',
+    price,
+    changePct,
+    date: new Date(priceTimeMs).toISOString(),
+    source: 'Yahoo Spot Gold/USD',
+  };
+}
+
+function normalizeGoldQuote(raw, source) {
+  if (!raw) return null;
+
+  // FRED returns an array when limit > 1.
+  if (Array.isArray(raw)) {
+    const valid = raw.filter(o => o?.value && o.value !== '.');
+
+    if (!valid.length) return null;
+
+    const latest   = Number(valid[0].value);
+    const previous = valid.length > 1 ? Number(valid[1].value) : null;
+
+    if (!Number.isFinite(latest) || latest <= 0) {
+      return null;
+    }
+
+    const changePct =
+      Number.isFinite(previous) && previous > 0
+        ? ((latest - previous) / previous) * 100
+        : null;
+
+    return {
+      symbol: 'GOLD',
+      name: 'Gold',
+      price: latest,
+      changePct,
+      date: valid[0].date ?? new Date().toISOString(),
+      source: source.name,
+    };
+  }
+
+  // Yahoo returns a normalized object from yahooChartLatest().
+  const price = Number(
+    raw.price ??
+    raw.value ??
+    raw.close ??
+    raw.last ??
+    raw.regularMarketPrice
+  );
+
+  if (!Number.isFinite(price) || price <= 0) {
+    return null;
+  }
+
+  return {
+    symbol: 'GOLD',
+    name: 'Gold',
+    price,
+    changePct: raw.changePct ?? null,
+    date: raw.date ?? raw.asOf ?? raw.timestamp ?? new Date().toISOString(),
+    source: raw.source ?? source.name,
+  };
+}
+
+
 async function fetchFinnhubNews(category, env) {
   const upstream = `https://finnhub.io/api/v1/news?category=${encodeURIComponent(category)}&token=${env.FINNHUB_API_KEY}`;
-  const resp = await fetch(upstream, { headers: { 'User-Agent': 'MarketBuzzHub/1.0' } });
-  if (!resp.ok) throw new Error(`Finnhub news: HTTP ${resp.status}`);
+
+  const resp = await fetch(upstream, {
+    headers: { 'User-Agent': 'MarketBuzzHub/1.0' },
+  });
+
+  if (!resp.ok) {
+    throw new Error(`Finnhub news: HTTP ${resp.status}`);
+  }
+
   return resp.json();
 }
 
 function formatNewsItems(raw) {
   if (!raw) return [];
-  const arr = Array.isArray(raw) ? raw : (raw.articles || raw.items || raw.news || []);
+
+  const arr = Array.isArray(raw)
+    ? raw
+    : (raw.articles || raw.items || raw.news || []);
+
   return arr.slice(0, 10).map(a => ({
     title:       a.headline || a.title  || '(no title)',
     url:         a.url      || '#',
@@ -334,23 +621,43 @@ function formatNewsItems(raw) {
   }));
 }
 
-function noop() { return Promise.resolve(null); }
+function noop() {
+  return Promise.resolve(null);
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 //  /api/sector-etfs/quote?symbol=XLK   — Finnhub real-time quote for one ETF
 // ────────────────────────────────────────────────────────────────────────────
 async function handleSectorQuote(url, env) {
   if (!env.FINNHUB_API_KEY) return jsonError('FINNHUB_API_KEY not set', 500);
-  const symbol = url.searchParams.get('symbol');
-  if (!symbol) return jsonError('Missing symbol', 400);
 
-  const upstream = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${env.FINNHUB_API_KEY}`;
+  const symbol = url.searchParams.get('symbol');
+
+  if (!symbol) {
+    return jsonError('Missing symbol', 400);
+  }
+
+  const upstream =
+    `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${env.FINNHUB_API_KEY}`;
+
   try {
     const resp = await fetch(upstream, { headers: { 'User-Agent': 'MarketBuzzHub/1.0' } });
-    if (!resp.ok) return jsonError(`Finnhub ${resp.status}`, resp.status);
+
+    if (!resp.ok) {
+      return jsonError(`Finnhub ${resp.status}`, resp.status);
+    }
+
     const d = await resp.json();
+
     // c=current, pc=prev close, dp=day%, h=high, l=low, o=open
-    return jsonOk({ c: d.c, pc: d.pc, dp: d.dp, h: d.h, l: d.l, o: d.o }, 300);
+    return jsonOk({
+      c: d.c,
+      pc: d.pc,
+      dp: d.dp,
+      h: d.h,
+      l: d.l,
+      o: d.o,
+    }, 300);
   } catch (e) {
     return jsonError(e.message, 502);
   }
@@ -362,22 +669,43 @@ async function handleSectorQuote(url, env) {
 // ────────────────────────────────────────────────────────────────────────────
 async function handleSectorCandle(url, env) {
   if (!env.FINNHUB_API_KEY) return jsonError('FINNHUB_API_KEY not set', 500);
+
   const symbol = url.searchParams.get('symbol');
   const from   = url.searchParams.get('from');
   const to     = url.searchParams.get('to');
-  if (!symbol || !from || !to) return jsonError('Missing symbol, from, or to', 400);
+
+  if (!symbol || !from || !to) {
+    return jsonError('Missing symbol, from, or to', 400);
+  }
 
   const upstream =
     `https://finnhub.io/api/v1/stock/candle` +
     `?symbol=${encodeURIComponent(symbol)}` +
     `&resolution=D&from=${from}&to=${to}` +
     `&token=${env.FINNHUB_API_KEY}`;
+
   try {
-    const resp = await fetch(upstream, { headers: { 'User-Agent': 'MarketBuzzHub/1.0' } });
-    if (!resp.ok) return jsonError(`Finnhub ${resp.status}`, resp.status);
+    const resp = await fetch(upstream, {
+      headers: { 'User-Agent': 'MarketBuzzHub/1.0' },
+    });
+
+    if (!resp.ok) {
+      return jsonError(`Finnhub ${resp.status}`, resp.status);
+    }
+
     const d = await resp.json();
-    if (d.s !== 'ok') return jsonError('No candle data', 404);
-    return jsonOk({ o: d.o, c: d.c, h: d.h, l: d.l, t: d.t }, 900);
+
+    if (d.s !== 'ok') {
+      return jsonError('No candle data', 404);
+    }
+
+    return jsonOk({
+      o: d.o,
+      c: d.c,
+      h: d.h,
+      l: d.l,
+      t: d.t,
+    }, 900);
   } catch (e) {
     return jsonError(e.message, 502);
   }
@@ -388,10 +716,10 @@ function jsonOk(data, maxAge = 0) {
   return new Response(JSON.stringify(data), {
     status: 200,
     headers: {
-      'Content-Type':                'application/json',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers':'Content-Type',
-      'Cache-Control':               `public, max-age=${maxAge}`,
+      'Content-Type':                 'application/json',
+      'Access-Control-Allow-Origin':  '*',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      'Cache-Control':                `public, max-age=${maxAge}`,
     },
   });
 }
